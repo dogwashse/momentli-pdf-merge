@@ -1,0 +1,15 @@
+
+services:
+  - type: web
+    name: momentli-pdf-merge
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: MERGE_API_SECRET
+        sync: false
