@@ -33,41 +33,41 @@ app.post("/merge", async (req, res) => {
   try {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-    // Download all batch PDFs
-    const batchBuffers = [];
-    for (let i = 0; i < storagePaths.length; i++) {
-      console.log(`Downloading batch ${i + 1}/${storagePaths.length}: ${storagePaths[i]}`);
-      const { data, error } = await supabase.storage
-        .from("print-queue")
-        .download(storagePaths[i]);
+    // INKREMENTELL MERGE: Ladda en batch i taget, aldrig mer än 2 PDFer i minnet
+    console.log("Starting incremental PDF merge...");
 
-      if (error || !data) {
-        throw new Error(`Failed to download ${storagePaths[i]}: ${error?.message}`);
-      }
+    // Ladda batch 0 som bas
+    console.log(`Loading base batch 1/${storagePaths.length}: ${storagePaths[0]}`);
+    const firstBuffer = await downloadBatch(supabase, storagePaths[0]);
+    let mergedPdf = await PDFDocument.load(firstBuffer);
+    firstBuffer.fill(0); // Frigör minne
+    console.log(`Base batch loaded: ${mergedPdf.getPageCount()} pages`);
 
-      const buffer = Buffer.from(await data.arrayBuffer());
-      batchBuffers.push(buffer);
-      console.log(`Batch ${i + 1} downloaded: ${buffer.length} bytes`);
-    }
+    // Merga in resten en i taget
+    for (let i = 1; i < storagePaths.length; i++) {
+      console.log(`Merging batch ${i + 1}/${storagePaths.length}: ${storagePaths[i]}`);
 
-    // Merge all PDFs
-    console.log("Starting PDF merge...");
-    const mergedPdf = await PDFDocument.load(batchBuffers[0]);
+      const batchBuffer = await downloadBatch(supabase, storagePaths[i]);
+      const batchPdf = await PDFDocument.load(batchBuffer);
+      batchBuffer.fill(0); // Frigör minne direkt efter load
 
-    for (let i = 1; i < batchBuffers.length; i++) {
-      console.log(`Merging batch ${i + 1}/${batchBuffers.length}...`);
-      const srcPdf = await PDFDocument.load(batchBuffers[i]);
-      const pages = await mergedPdf.copyPages(srcPdf, srcPdf.getPageIndices());
+      const pages = await mergedPdf.copyPages(batchPdf, batchPdf.getPageIndices());
       for (const page of pages) {
         mergedPdf.addPage(page);
       }
+
+      console.log(`After batch ${i + 1}: ${mergedPdf.getPageCount()} pages total`);
     }
 
+    // Spara slutresultatet
+    console.log("Saving merged PDF...");
     const mergedBytes = await mergedPdf.save();
     const pageCount = mergedPdf.getPageCount();
+    mergedPdf = null; // Frigör minne
+
     console.log(`Merge complete: ${mergedBytes.length} bytes, ${pageCount} pages`);
 
-    // Upload merged PDF to Storage
+    // Ladda upp till Storage
     const outputPath = `temp/${orderId}/merged_${format}.pdf`;
     const { error: uploadError } = await supabase.storage
       .from("print-queue")
@@ -87,6 +87,7 @@ app.post("/merge", async (req, res) => {
       size: mergedBytes.length,
       pages: pageCount,
     });
+
   } catch (err) {
     console.error("Merge failed:", err);
     res.status(500).json({
@@ -94,6 +95,18 @@ app.post("/merge", async (req, res) => {
     });
   }
 });
+
+async function downloadBatch(supabase, storagePath) {
+  const { data, error } = await supabase.storage
+    .from("print-queue")
+    .download(storagePath);
+
+  if (error || !data) {
+    throw new Error(`Failed to download ${storagePath}: ${error?.message}`);
+  }
+
+  return Buffer.from(await data.arrayBuffer());
+}
 
 app.listen(PORT, () => {
   console.log(`PDF merge service running on port ${PORT}`);
