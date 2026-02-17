@@ -2,6 +2,7 @@ const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 const { PDFDocument } = require("pdf-lib");
 const ftp = require("basic-ftp");
+const { Readable } = require("stream");
 
 const app = express();
 app.use(express.json({ limit: "200mb" }));
@@ -13,7 +14,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "momentli-pdf-merge", version: "2.0.0" });
+  res.json({ status: "ok", service: "momentli-pdf-merge", version: "2.1.0" });
 });
 
 // Auth middleware
@@ -25,9 +26,9 @@ function checkAuth(req, res, next) {
   next();
 }
 
-// ========== MERGE ONLY (legacy, kept for backwards compat) ==========
+// ========== MERGE ONLY (legacy) ==========
 app.post("/merge", checkAuth, async (req, res) => {
-  const { storagePaths, orderId, format, orderNumber } = req.body;
+  const { storagePaths, orderId, format } = req.body;
 
   if (!storagePaths || !Array.isArray(storagePaths) || storagePaths.length === 0) {
     return res.status(400).json({ error: "storagePaths is required" });
@@ -39,7 +40,6 @@ app.post("/merge", checkAuth, async (req, res) => {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     const { mergedBytes, pageCount } = await mergeBatches(supabase, storagePaths);
 
-    // Upload to Storage
     const outputPath = `temp/${orderId}/merged_${format}.pdf`;
     const { error: uploadError } = await supabase.storage
       .from("print-queue")
@@ -48,7 +48,6 @@ app.post("/merge", checkAuth, async (req, res) => {
     if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
 
     console.log(`[merge] Done: ${outputPath}, ${mergedBytes.length} bytes, ${pageCount} pages`);
-
     res.json({ storagePath: outputPath, size: mergedBytes.length, pages: pageCount });
   } catch (err) {
     console.error("[merge] Failed:", err);
@@ -56,9 +55,9 @@ app.post("/merge", checkAuth, async (req, res) => {
   }
 });
 
-// ========== MERGE + FTP UPLOAD (new) ==========
+// ========== MERGE + FTP UPLOAD ==========
 app.post("/merge-and-upload", checkAuth, async (req, res) => {
-  const { storagePaths, orderId, format, orderNumber, ftp: ftpConfig, xmlContent, xmlFilename, pdfFilename } = req.body;
+  const { storagePaths, orderId, format, ftp: ftpConfig, xmlContent, xmlFilename, pdfFilename } = req.body;
 
   if (!storagePaths || !Array.isArray(storagePaths) || storagePaths.length === 0) {
     return res.status(400).json({ error: "storagePaths is required" });
@@ -74,16 +73,16 @@ app.post("/merge-and-upload", checkAuth, async (req, res) => {
 
   try {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-    
+
     // Step 1: Merge PDFs
     const { mergedBytes, pageCount } = await mergeBatches(supabase, storagePaths);
     console.log(`[merge-and-upload] Merged: ${mergedBytes.length} bytes, ${pageCount} pages`);
 
-    // Step 2: Upload to FTP
+    // Step 2: FTP upload
     console.log(`[merge-and-upload] Connecting to FTP: ${ftpConfig.host}`);
     const client = new ftp.Client();
     client.ftp.verbose = false;
-    
+
     try {
       await client.access({
         host: ftpConfig.host,
@@ -91,28 +90,25 @@ app.post("/merge-and-upload", checkAuth, async (req, res) => {
         password: ftpConfig.password,
         secure: false,
       });
-      
-      // Upload PDF first (print shop requirement)
+
+      // Upload PDF
       console.log(`[merge-and-upload] Uploading PDF: ${pdfFilename} (${mergedBytes.length} bytes)`);
-      const { Readable } = require("stream");
-      const pdfStream = Readable.from(Buffer.from(mergedBytes));
-      await client.uploadFrom(pdfStream, pdfFilename);
+      await client.uploadFrom(Readable.from(Buffer.from(mergedBytes)), pdfFilename);
       console.log(`[merge-and-upload] PDF uploaded: ${pdfFilename}`);
 
       // Upload XML if provided
       let xmlUploaded = false;
       if (xmlContent && xmlFilename) {
         console.log(`[merge-and-upload] Uploading XML: ${xmlFilename}`);
-        const xmlStream = Readable.from(Buffer.from(xmlContent, "utf-8"));
-        await client.uploadFrom(xmlStream, xmlFilename);
+        await client.uploadFrom(Readable.from(Buffer.from(xmlContent, "utf-8")), xmlFilename);
         xmlUploaded = true;
         console.log(`[merge-and-upload] XML uploaded: ${xmlFilename}`);
       }
-      
+
       client.close();
       console.log(`[merge-and-upload] FTP complete`);
 
-      // Step 3: Clean up batch files from Storage
+      // Step 3: Clean up batch files
       console.log(`[merge-and-upload] Cleaning up ${storagePaths.length} batch files`);
       try {
         await supabase.storage.from("print-queue").remove(storagePaths);
@@ -145,15 +141,15 @@ async function mergeBatches(supabase, storagePaths) {
   console.log(`Starting incremental merge of ${storagePaths.length} batches...`);
 
   const firstBuffer = await downloadBatch(supabase, storagePaths[0]);
+  // NOTE: Do NOT call buffer.fill(0) — pdf-lib still references this memory for image data
   let mergedPdf = await PDFDocument.load(firstBuffer);
-  firstBuffer.fill(0);
   console.log(`Base batch: ${mergedPdf.getPageCount()} pages`);
 
   for (let i = 1; i < storagePaths.length; i++) {
     console.log(`Merging batch ${i + 1}/${storagePaths.length}`);
     const batchBuffer = await downloadBatch(supabase, storagePaths[i]);
+    // NOTE: Do NOT call buffer.fill(0) — pdf-lib still references this memory for image data
     const batchPdf = await PDFDocument.load(batchBuffer);
-    batchBuffer.fill(0);
 
     const pages = await mergedPdf.copyPages(batchPdf, batchPdf.getPageIndices());
     for (const page of pages) {
@@ -183,5 +179,5 @@ async function downloadBatch(supabase, storagePath) {
 }
 
 app.listen(PORT, () => {
-  console.log(`PDF merge+upload service v2.0 running on port ${PORT}`);
+  console.log(`PDF merge+upload service v2.1 running on port ${PORT}`);
 });
